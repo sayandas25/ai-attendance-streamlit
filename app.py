@@ -12,9 +12,9 @@ import streamlit as st
 from PIL import Image
 import plotly.express as px
 
-# Optional AI imports
+# Cloud-friendly AI imports: OpenCV-based face detection + image embedding
 try:
-    import face_recognition
+    import cv2
     FACE_ENGINE_AVAILABLE = True
 except Exception:
     FACE_ENGINE_AVAILABLE = False
@@ -154,21 +154,76 @@ def pil_to_rgb_array(image: Image.Image):
     return np.array(image.convert("RGB"))
 
 
+def pil_to_bgr_array(image: Image.Image):
+    rgb = pil_to_rgb_array(image)
+    if not FACE_ENGINE_AVAILABLE:
+        return rgb
+    return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+
+def detect_face_crops(image: Image.Image):
+    """
+    Cloud-friendly face detection using OpenCV Haar cascades.
+    Returns aligned/resized grayscale face crops and bounding boxes.
+    """
+    if not FACE_ENGINE_AVAILABLE:
+        return [], [], "AI face engine is not installed. Install requirements.txt and reboot the app."
+
+    bgr = pil_to_bgr_array(image)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    detector = cv2.CascadeClassifier(cascade_path)
+
+    faces = detector.detectMultiScale(
+        gray,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(60, 60)
+    )
+
+    crops = []
+    boxes = []
+
+    for (x, y, w, h) in faces:
+        face = gray[y:y+h, x:x+w]
+        face = cv2.equalizeHist(face)
+        face = cv2.resize(face, (96, 96), interpolation=cv2.INTER_AREA)
+        crops.append(face)
+        boxes.append((int(x), int(y), int(w), int(h)))
+
+    return crops, boxes, f"Detected {len(crops)} face(s)."
+
+
+def face_embedding_from_crop(face_crop):
+    """
+    Lightweight face descriptor:
+    - resized grayscale face
+    - normalized pixel vector
+    - L2 normalization
+
+    This is cloud-friendly and works for demonstration/prototype use.
+    For production, replace this with InsightFace/DeepFace embeddings.
+    """
+    vec = face_crop.astype("float32").flatten()
+    vec = (vec - vec.mean()) / (vec.std() + 1e-6)
+    norm = np.linalg.norm(vec) + 1e-6
+    return vec / norm
+
+
 def get_face_encoding(image: Image.Image):
     if not FACE_ENGINE_AVAILABLE:
-        return None, "AI face engine is not installed. Install requirements_full.txt to enable recognition."
+        return None, "AI face engine is not installed. Install requirements.txt and reboot the app."
 
-    arr = pil_to_rgb_array(image)
-    face_locations = face_recognition.face_locations(arr, model="hog")
-    if len(face_locations) == 0:
-        return None, "No face detected. Please use a clear front-facing photo."
-    if len(face_locations) > 1:
+    crops, boxes, msg = detect_face_crops(image)
+
+    if len(crops) == 0:
+        return None, "No face detected. Please use a clear front-facing photo with good lighting."
+    if len(crops) > 1:
         return None, "Multiple faces detected. Please upload one student's face only."
 
-    encodings = face_recognition.face_encodings(arr, face_locations)
-    if not encodings:
-        return None, "Face could not be encoded. Try a clearer image."
-    return encodings[0], "Face encoded successfully."
+    encoding = face_embedding_from_crop(crops[0])
+    return encoding, "Face encoded successfully."
 
 
 def serialize_encoding(encoding):
@@ -186,7 +241,19 @@ def save_face_image(student_code, image):
     return str(path)
 
 
+def cosine_similarity(a, b):
+    a = np.asarray(a, dtype="float32")
+    b = np.asarray(b, dtype="float32")
+    return float(np.dot(a, b) / ((np.linalg.norm(a) * np.linalg.norm(b)) + 1e-6))
+
+
 def identify_faces(image: Image.Image, class_id: int, tolerance: float = 0.50):
+    """
+    Matches captured faces against stored student face descriptors.
+
+    The UI tolerance slider is converted to a similarity threshold:
+    lower tolerance = stricter, higher tolerance = more permissive.
+    """
     if not FACE_ENGINE_AVAILABLE:
         return [], "AI face engine is not installed."
 
@@ -199,35 +266,40 @@ def identify_faces(image: Image.Image, class_id: int, tolerance: float = 0.50):
     conn.close()
 
     if not rows:
-        return [], "No enrolled student faces found for this class."
+        return [], "No enrolled student faces found for this class. Register students first."
 
     known_encodings = [deserialize_encoding(r[3]) for r in rows]
     known_meta = [{"student_id": r[0], "student_code": r[1], "full_name": r[2]} for r in rows]
 
-    arr = pil_to_rgb_array(image)
-    locations = face_recognition.face_locations(arr, model="hog")
-    encodings = face_recognition.face_encodings(arr, locations)
+    crops, boxes, detect_msg = detect_face_crops(image)
+
+    if not crops:
+        return [], "No face detected in attendance photo."
+
+    # Convert tolerance range to similarity threshold.
+    # 0.35 -> very strict around 0.76
+    # 0.65 -> more permissive around 0.58
+    similarity_threshold = 0.97 - (tolerance * 0.60)
 
     matches = []
-    for enc in encodings:
-        distances = face_recognition.face_distance(known_encodings, enc)
-        if len(distances) == 0:
-            continue
-        best_idx = int(np.argmin(distances))
-        best_distance = float(distances[best_idx])
-        confidence = max(0.0, min(1.0, 1.0 - best_distance))
-        if best_distance <= tolerance:
+    for crop in crops:
+        enc = face_embedding_from_crop(crop)
+        sims = [cosine_similarity(enc, known) for known in known_encodings]
+        best_idx = int(np.argmax(sims))
+        best_similarity = float(sims[best_idx])
+
+        if best_similarity >= similarity_threshold:
             m = dict(known_meta[best_idx])
-            m["distance"] = best_distance
-            m["confidence"] = confidence
+            m["distance"] = 1.0 - best_similarity
+            m["confidence"] = max(0.0, min(1.0, best_similarity))
             matches.append(m)
 
     unique = {}
     for m in matches:
-        if m["student_id"] not in unique or m["distance"] < unique[m["student_id"]]["distance"]:
+        if m["student_id"] not in unique or m["confidence"] > unique[m["student_id"]]["confidence"]:
             unique[m["student_id"]] = m
 
-    return list(unique.values()), f"Detected {len(locations)} face(s), matched {len(unique)} student(s)."
+    return list(unique.values()), f"{detect_msg} Matched {len(unique)} student(s)."
 
 
 # ---------------------------
@@ -459,7 +531,7 @@ def admin_page(user):
                         st.error(msg)
 
         if not FACE_ENGINE_AVAILABLE:
-            st.warning("Face recognition library is not installed in this environment. Install full requirements to enable face enrollment.")
+            st.warning("OpenCV AI face engine is not installed. Check requirements.txt and reboot the app.")
 
     with tabs[3]:
         class_filter, class_name = class_selector("Filter by class")
@@ -550,13 +622,12 @@ def system_status_page():
     st.header("System Status")
     st.write("Database:", str(DB_PATH))
     st.write("Face engine available:", FACE_ENGINE_AVAILABLE)
+    st.write("Face engine:", "OpenCV cloud-friendly detector/descriptor" if FACE_ENGINE_AVAILABLE else "Unavailable")
     st.write("Password hashing:", "bcrypt" if BCRYPT_AVAILABLE else "SHA-256 fallback")
     if not FACE_ENGINE_AVAILABLE:
         st.warning("""
         The app UI and database will work, but AI recognition is disabled.
-        To enable it, install the full requirements:
-
-        `pip install -r requirements_full.txt`
+        To enable it online, make sure requirements.txt contains opencv-python-headless and reboot the app.
         """)
 
 
